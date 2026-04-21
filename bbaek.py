@@ -9,8 +9,11 @@ solved.ac API로 브론즈·실버·골드·다이아 티어를 고르고,
 
 문제 본문은 acmicpc.net 페이지의 `#problem-body`에서 텍스트로 추출해 터미널에 출력한다.
 
+프로그래머스(선택 시)는 `school.programmers.co.kr` API로 난이도(레벨)·파트(`partTitle`)별 후보를 만든 뒤,
+문제 페이지의 `.markdown` 블록에서 본문을 추출한다.
+
 한 번 추천된 문제는 기본적으로 이 스크립트와 같은 디렉터리의 `seen.json`에
-(문제 번호·유형·백준 URL·난이도·제목 등) 저장되며,
+(플랫폼·문제 번호·유형·URL·난이도·제목 등) 저장되며,
 다음 실행부터 같은 조건의 무작위 추천에서 제외한다(`--no-skip-seen`으로 끌 수 있음).
 
 검색 쿼리는 solved.ac 웹 검색과 동일한 문법을 쓴다.
@@ -52,6 +55,36 @@ BOJ_HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
 }
+
+PROGRAMMERS_SCHOOL_API = "https://school.programmers.co.kr/api/v2/school/challenges/"
+PROGRAMMERS_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json",
+    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+}
+
+# 백준 티어 → 프로그래머스 challenge level (API `levels[]`)
+TIER_PROGRAMMERS_LEVELS: Dict[str, List[int]] = {
+    "bronze": [0, 1],
+    "silver": [2],
+    "gold": [3],
+    "diamond": [4, 5],
+}
+
+PROGRAMMERS_LEVEL_LABEL_KO: Dict[int, str] = {
+    0: "레벨 0",
+    1: "레벨 1",
+    2: "레벨 2",
+    3: "레벨 3",
+    4: "레벨 4",
+    5: "레벨 5",
+}
+
+COURSE_ID_DEFAULT = 30  # 코딩테스트 연습
+
 
 class _ProblemBodyTextParser(HTMLParser):
     """`<div id="problem-body">` 안의 텍스트만 뽑는다(스크립트·스타일 제외).
@@ -204,6 +237,263 @@ def extract_problem_body_text(page_html: str) -> str:
         text = text.replace("\n\n\n", "\n\n")
     text = text.strip()
     return clean_statement_for_terminal(text)
+
+
+class _ProgrammersMarkdownParser(HTMLParser):
+    """`<div class="markdown ...">` 안의 텍스트만 뽑는다(스크립트·스타일·이미지 제외)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._capture = False
+        self._div_depth = 0
+        self._skip = 0
+        self.parts: List[str] = []
+
+    def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
+        a = {k: v for k, v in attrs}
+        cls = (a.get("class") or "") + " "
+        if not self._capture:
+            if tag == "div" and "markdown" in cls:
+                self._capture = True
+                self._div_depth = 1
+            return
+        if tag in ("script", "style", "textarea", "noscript"):
+            self._skip += 1
+            return
+        if self._skip:
+            return
+        if tag == "img":
+            alt = (a.get("alt") or "").strip()
+            if alt:
+                self.parts.append(f"[이미지: {alt}]")
+            else:
+                self.parts.append("[이미지]")
+            return
+        if tag == "br":
+            self.parts.append("\n")
+            return
+        if tag == "div":
+            self._div_depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if not self._capture:
+            return
+        if tag in ("script", "style", "textarea", "noscript") and self._skip:
+            self._skip -= 1
+            return
+        if self._skip:
+            return
+        if tag == "div":
+            self._div_depth -= 1
+            if self._div_depth <= 0:
+                self._capture = False
+
+    def handle_data(self, data: str) -> None:
+        if self._capture and not self._skip:
+            self.parts.append(data)
+
+
+def fetch_programmers_lesson_html(lesson_id: int, retries: int = 4) -> str:
+    url = f"https://school.programmers.co.kr/learn/courses/{COURSE_ID_DEFAULT}/lessons/{lesson_id}"
+    last: Optional[BaseException] = None
+    for attempt in range(retries):
+        req = urllib.request.Request(url, headers=BOJ_HEADERS, method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+                return resp.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as e:
+            last = e
+            if e.code in (429, 502, 503, 504) and attempt + 1 < retries:
+                time.sleep(0.6 * (attempt + 1))
+                continue
+            raise
+        except urllib.error.URLError as e:
+            last = e
+            if attempt + 1 < retries:
+                time.sleep(0.6 * (attempt + 1))
+                continue
+            raise
+    assert last is not None
+    raise last
+
+
+def extract_programmers_markdown_text(page_html: str) -> str:
+    p = _ProgrammersMarkdownParser()
+    p.feed(page_html)
+    p.close()
+    raw = "".join(p.parts)
+    raw = html_module.unescape(raw)
+    lines = [ln.rstrip() for ln in raw.splitlines()]
+    text = "\n".join(lines)
+    while "\n\n\n" in text:
+        text = text.replace("\n\n\n", "\n\n")
+    text = text.strip()
+    return clean_statement_for_terminal(text)
+
+
+def http_get_json_programmers(params: Dict[str, Any]) -> Dict[str, Any]:
+    q = urllib.parse.urlencode(params, doseq=True)
+    url = f"{PROGRAMMERS_SCHOOL_API}?{q}"
+    req = urllib.request.Request(url, headers=PROGRAMMERS_HEADERS, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+            raw = resp.read().decode("utf-8")
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")[:500]
+        raise SystemExit(f"HTTP {e.code} programmers challenges: {body}") from e
+    except urllib.error.URLError as e:
+        raise SystemExit(f"프로그래머스 API 요청 실패: {e}") from e
+    return json.loads(raw)
+
+
+def fetch_all_programmers_challenges(levels: List[int]) -> List[Dict[str, Any]]:
+    """선택한 레벨들에 해당하는 챌린지 전부(페이지 순회)."""
+    out: List[Dict[str, Any]] = []
+    page = 1
+    params: Dict[str, Any] = {
+        "perPage": 30,
+        "page": page,
+        "order": "level",
+        "levels[]": levels,
+    }
+    while True:
+        params["page"] = page
+        data = http_get_json_programmers(params)
+        items = data.get("result") or []
+        out.extend(items)
+        total_pages = int(data.get("totalPages") or 0)
+        if page >= total_pages or not items:
+            break
+        page += 1
+    return out
+
+
+def programmers_part_groups(
+    challenges: List[Dict[str, Any]],
+    *,
+    min_count: int = 1,
+) -> List[Dict[str, Any]]:
+    """`partTitle` 기준으로 묶어 solved.ac 태그 목록과 비슷한 dict 리스트로 만든다."""
+    counts: Dict[str, int] = {}
+    for c in challenges:
+        pt = str(c.get("partTitle") or "").strip() or "(파트 없음)"
+        counts[pt] = counts.get(pt, 0) + 1
+    rows: List[Dict[str, Any]] = []
+    for title, cnt in counts.items():
+        if cnt >= min_count:
+            rows.append({"key": title, "partTitle": title, "tierMatchCount": cnt})
+    return sort_tags_for_display(rows)
+
+
+def tag_ko_name_programmers(tag: Dict[str, Any]) -> str:
+    return str(tag.get("partTitle") or tag.get("key") or "")
+
+
+def pick_programmers_challenge(
+    challenges: List[Dict[str, Any]],
+    tag_mode: str,
+    part_tags: List[Dict[str, Any]],
+    chosen_tag: Optional[Dict[str, Any]] = None,
+    *,
+    max_attempts: int = 80,
+    seen_keys: Optional[Set[Tuple[str, int]]] = None,
+) -> Tuple[Dict[str, Any], Optional[str]]:
+    """seen_keys: {('programmers', lesson_id), ...}. 반환: (challenge, part_title 또는 None)."""
+    seen = seen_keys if seen_keys is not None else set()
+    key_prog = "programmers"
+
+    def not_seen(c: Dict[str, Any]) -> bool:
+        lid = int(c.get("id") or 0)
+        return (key_prog, lid) not in seen
+
+    if tag_mode == "none":
+        pool = [c for c in challenges if not_seen(c)]
+        if not pool:
+            raise SystemExit(
+                "조건에 맞는 새 문제가 없습니다. `--reset-seen` 또는 `--no-skip-seen`을 쓰거나 "
+                "다른 티어를 고르세요."
+            )
+        return random.choice(pool), None
+
+    if tag_mode == "chosen":
+        if not chosen_tag:
+            raise SystemExit("선택된 유형(파트)이 없습니다.")
+        label = tag_ko_name_programmers(chosen_tag)
+        pool = [
+            c
+            for c in challenges
+            if str(c.get("partTitle") or "").strip() == label and not_seen(c)
+        ]
+        if not pool:
+            raise SystemExit(
+                f"파트 '{label}'에서 아직 안 본 문제가 없습니다. 기록을 비우거나 다른 파트를 고르세요."
+            )
+        return random.choice(pool), label
+
+    # random: 파트 목록에서 무작위로 고른 뒤 해당 파트에서 무작위
+    if not part_tags:
+        raise SystemExit("파트 목록이 비어 있어 유형 무작위를 쓸 수 없습니다.")
+    shuffled = part_tags[:]
+    random.shuffle(shuffled)
+    for tag in shuffled[:max_attempts]:
+        label = tag_ko_name_programmers(tag)
+        pool = [
+            c
+            for c in challenges
+            if str(c.get("partTitle") or "").strip() == label and not_seen(c)
+        ]
+        if pool:
+            return random.choice(pool), label
+    raise SystemExit(
+        f"{max_attempts}번 시도했지만 아직 안 본 문제가 있는 파트를 찾지 못했습니다. "
+        "`--reset-seen`으로 기록을 비우거나 티어를 바꿔 보세요."
+    )
+
+
+def print_programmers_problem(
+    ch: Dict[str, Any],
+    *,
+    part_label: Optional[str],
+    show_statement: bool = True,
+) -> None:
+    lid = int(ch.get("id") or 0)
+    title = str(ch.get("title") or "")
+    level = int(ch.get("level") or 0)
+    part = str(ch.get("partTitle") or "")
+    url = f"https://school.programmers.co.kr/learn/courses/{COURSE_ID_DEFAULT}/lessons/{lid}"
+    lvl_name = PROGRAMMERS_LEVEL_LABEL_KO.get(level, f"레벨 {level}")
+
+    print()
+    print(f"문제 ID(레슨): {lid}")
+    print(f"제목: {title}")
+    print(f"난이도: {lvl_name} ({level})")
+    if part:
+        print(f"파트: {part}")
+    if part_label:
+        print(f"선택된 유형(파트): {part_label}")
+    print(f"프로그래머스: {url}")
+
+    if show_statement and lid > 0:
+        try:
+            page = fetch_programmers_lesson_html(lid)
+            body = extract_programmers_markdown_text(page)
+        except (urllib.error.HTTPError, urllib.error.URLError, OSError, ValueError) as e:
+            print()
+            print("— 문제 본문을 가져오지 못했습니다:", e)
+            print("  브라우저에서 위 프로그래머스 링크를 여세요.")
+        else:
+            if body:
+                print()
+                print("— 문제 본문 —")
+                print(body)
+            else:
+                print()
+                print(
+                    "— 본문 블록(.markdown)을 찾지 못했습니다. "
+                    "페이지 구조가 바뀌었을 수 있습니다. 위 링크를 확인하세요."
+                )
+    print()
+
 
 # solved.ac 문제 난이도(0~30) → 한글 표기
 LEVEL_NAMES_KO: Dict[int, str] = {
@@ -438,6 +728,7 @@ def load_seen_entries(path: Path) -> List[Dict[str, Any]]:
     if raw:
         return [
             {
+                "source": "boj",
                 "problem_id": int(x),
                 "type": None,
                 "url": f"https://www.acmicpc.net/problem/{int(x)}",
@@ -451,7 +742,21 @@ def load_seen_entries(path: Path) -> List[Dict[str, Any]]:
 
 
 def load_seen_ids(path: Path) -> Set[int]:
-    return {int(e["problem_id"]) for e in load_seen_entries(path)}
+    """하위 호환: 백준 번호만 집합으로 돌려준다(다른 플랫폼 기록은 무시)."""
+    return {
+        int(e["problem_id"])
+        for e in load_seen_entries(path)
+        if str(e.get("source") or "boj") == "boj"
+    }
+
+
+def load_seen_key_set(path: Path) -> Set[Tuple[str, int]]:
+    """기록에 있는 (플랫폼, 문제 id) 집합. `source` 없으면 백준으로 간주."""
+    out: Set[Tuple[str, int]] = set()
+    for e in load_seen_entries(path):
+        src = str(e.get("source") or "boj")
+        out.add((src, int(e["problem_id"])))
+    return out
 
 
 def save_seen_problems(path: Path, problems: List[Dict[str, Any]]) -> None:
@@ -465,11 +770,14 @@ def save_seen_problems(path: Path, problems: List[Dict[str, Any]]) -> None:
 
 def append_seen_record(path: Path, record: Dict[str, Any]) -> None:
     pid = int(record["problem_id"])
+    src = str(record.get("source") or "boj")
     entries = load_seen_entries(path)
     existing = {
-        int(e["problem_id"]) for e in entries if e.get("problem_id") is not None
+        (str(e.get("source") or "boj"), int(e["problem_id"]))
+        for e in entries
+        if e.get("problem_id") is not None
     }
-    if pid in existing:
+    if (src, pid) in existing:
         return
     entries.append(record)
     save_seen_problems(path, entries)
@@ -477,18 +785,18 @@ def append_seen_record(path: Path, record: Dict[str, Any]) -> None:
 
 def search_random_problem_avoiding(
     query: str,
-    seen_ids: Set[int],
+    seen_keys: Set[Tuple[str, int]],
     *,
     max_draws: int = 150,
 ) -> Tuple[Dict[str, Any], int]:
-    """무작위 추천을 반복해 `seen_ids`에 없는 문제를 고른다."""
+    """무작위 추천을 반복해 (`boj`, 문제번호)가 `seen_keys`에 없는 문제를 고른다."""
     last_cnt = 0
     for _ in range(max_draws):
         prob, last_cnt = search_random_problem(query)
         if not prob:
             return prob, last_cnt
         pid = int(prob.get("problemId") or 0)
-        if pid not in seen_ids:
+        if ("boj", pid) not in seen_keys:
             return prob, last_cnt
     raise SystemExit(
         f"{max_draws}번 무작위 추천했지만 모두 이미 기록된 문제입니다. "
@@ -523,16 +831,34 @@ def seen_record_for_problem(
     *,
     lang: str,
 ) -> Dict[str, Any]:
-    """seen.json 한 건: 문제 번호, 유형, 백준 URL, 난이도(level·한글), 제목."""
+    """seen.json 한 건: 플랫폼, 문제 번호, 유형, 백준 URL, 난이도(level·한글), 제목."""
     pid = int(prob.get("problemId") or 0)
     level = int(prob.get("level") or 0)
     return {
+        "source": "boj",
         "problem_id": pid,
         "type": tag_label,
         "url": f"https://www.acmicpc.net/problem/{pid}",
         "level": level,
         "level_label": level_label(level),
         "title": problem_display_title(prob, lang),
+    }
+
+
+def seen_record_for_programmers(
+    ch: Dict[str, Any],
+    part_label: Optional[str],
+) -> Dict[str, Any]:
+    lid = int(ch.get("id") or 0)
+    lv = int(ch.get("level") or 0)
+    return {
+        "source": "programmers",
+        "problem_id": lid,
+        "type": part_label,
+        "url": f"https://school.programmers.co.kr/learn/courses/{COURSE_ID_DEFAULT}/lessons/{lid}",
+        "level": lv,
+        "level_label": PROGRAMMERS_LEVEL_LABEL_KO.get(lv, f"레벨 {lv}"),
+        "title": str(ch.get("title") or ""),
     }
 
 
@@ -544,17 +870,17 @@ def pick_problem(
     *,
     lang: str = "ko",
     max_attempts: int = 40,
-    seen_ids: Optional[Set[int]] = None,
+    seen_keys: Optional[Set[Tuple[str, int]]] = None,
 ) -> Tuple[Dict[str, Any], str, Optional[str]]:
     """
     tier: bronze|silver|gold|diamond
     lang: ko | en | all (all이면 solved.ac `lang:` 미사용)
     tag_mode: none | random | chosen
     chosen_tag: tag_mode가 chosen일 때만 사용.
-    seen_ids: 비어 있지 않으면 무작위 추천에서 해당 번호는 제외(재시도).
+    seen_keys: 비어 있지 않으면 무작위 추천에서 (`boj`, 번호)는 제외(재시도).
     반환: (problem, 검색에 쓴 쿼리 문자열, 태그 한글명 또는 None)
     """
-    seen = seen_ids if seen_ids is not None else set()
+    seen = seen_keys if seen_keys is not None else set()
 
     def _random(q: str) -> Tuple[Dict[str, Any], int]:
         if seen:
@@ -656,7 +982,14 @@ def print_problem(
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="티어(브론즈~다이아)와 문제 유형(태그)으로 백준 문제 하나를 추천합니다.",
+        description="티어(브론즈~다이아)와 문제 유형으로 백준 또는 프로그래머스 문제 하나를 추천합니다.",
+    )
+    p.add_argument(
+        "--platform",
+        choices=["boj", "programmers"],
+        default=None,
+        metavar="boj|programmers",
+        help="boj=백준(solved.ac), programmers=프로그래머스. 생략 시 터미널이면 묻는다.",
     )
     p.add_argument(
         "--tier",
@@ -752,6 +1085,19 @@ def interactive_tier() -> str:
         print("1에서 4 사이 숫자를 입력하세요.")
 
 
+def interactive_platform() -> str:
+    print("플랫폼을 고르세요.")
+    print("  1. 백준 (solved.ac + acmicpc.net)")
+    print("  2. 프로그래머스 (school.programmers.co.kr)")
+    while True:
+        s = input("번호 (1-2): ").strip()
+        if s == "1":
+            return "boj"
+        if s == "2":
+            return "programmers"
+        print("1 또는 2를 입력하세요.")
+
+
 def interactive_language() -> str:
     print("문제 언어를 고르세요.")
     print("  1. 한국어 (solved.ac lang:ko)")
@@ -768,13 +1114,19 @@ def interactive_language() -> str:
         print("1, 2 또는 3을 입력하세요.")
 
 
-def interactive_tag_selection(sorted_tags: List[Dict[str, Any]]) -> Tuple[str, Optional[Dict[str, Any]]]:
+def interactive_tag_selection(
+    sorted_tags: List[Dict[str, Any]],
+    *,
+    kind: str = "태그",
+) -> Tuple[str, Optional[Dict[str, Any]]]:
     """0=티어만, r=유형 무작위, 1..N=해당 유형."""
     print()
-    print("— 문제 유형 (태그) —")
+    print(f"— 문제 유형 ({kind}) —")
     print("  0  티어만       이 난이도 전체에서 유형 필터 없이 무작위")
-    print("  r  무작위 유형  아래 목록에서 태그 하나를 무작위로 고른 뒤, 그 유형으로 문제 무작위")
-    print("  ([숫자] = 선택한 검색 조건에서 해당 유형 문제 개수)")
+    print(
+        f"  r  무작위 유형  아래 목록에서 {kind} 하나를 무작위로 고른 뒤, 그 조건으로 문제 무작위"
+    )
+    print("  ([숫자] = 선택한 검색 조건에서 해당 항목 문제 개수)")
     print()
     for i, t in enumerate(sorted_tags, 1):
         ko = tag_ko_name(t)
@@ -802,11 +1154,94 @@ def main(argv: Optional[List[str]] = None) -> None:
     seen_path = args.seen_file or default_seen_path()
     if args.reset_seen:
         save_seen_problems(seen_path, [])
-    seen: Set[int] = load_seen_ids(seen_path) if args.skip_seen else set()
+    seen_keys: Set[Tuple[str, int]] = (
+        load_seen_key_set(seen_path) if args.skip_seen else set()
+    )
 
     if args.seed is not None:
         random.seed(args.seed)
 
+    platform = args.platform
+    if platform is None:
+        if sys.stdin.isatty():
+            platform = interactive_platform()
+        else:
+            platform = "boj"
+
+    if platform == "programmers":
+        main_programmers(args, seen_path, seen_keys)
+    else:
+        main_boj(args, seen_path, seen_keys)
+
+
+def main_programmers(
+    args: argparse.Namespace,
+    seen_path: Path,
+    seen_keys: Set[Tuple[str, int]],
+) -> None:
+    explicit_tag = (
+        args.no_random_tag
+        or args.tag_random
+        or (args.tag_key is not None)
+        or (args.tag_index is not None)
+    )
+    if explicit_tag:
+        raise SystemExit(
+            "프로그래머스 모드에서는 solved.ac 전용 옵션(--no-random-tag / --tag-random / "
+            "--tag-key / --tag-index)을 쓸 수 없습니다. 터미널에서 대화형으로 실행하거나 "
+            "`--platform boj`로 백준을 선택하세요."
+        )
+
+    if args.tier is None:
+        tier = interactive_tier()
+    else:
+        tier = args.tier
+
+    levels = TIER_PROGRAMMERS_LEVELS[tier]
+
+    challenges = fetch_all_programmers_challenges(levels)
+    if not challenges:
+        raise SystemExit("선택한 티어(레벨)에 해당하는 문제를 API에서 가져오지 못했습니다.")
+
+    part_tags = programmers_part_groups(challenges, min_count=args.min_tag_problems)
+    if not part_tags:
+        raise SystemExit(
+            "파트(`partTitle`)별로 묶인 문제가 없습니다. `--min-tag-problems`를 낮춰 보세요."
+        )
+
+    chosen_tag: Optional[Dict[str, Any]] = None
+    if sys.stdin.isatty():
+        tag_mode, chosen_tag = interactive_tag_selection(
+            part_tags,
+            kind="파트(partTitle)",
+        )
+    else:
+        if args.tier is None:
+            print(
+                "참고: 표준 입력이 터미널이 아니어 파트 목록을 띄우지 못합니다. "
+                "파트 무작위로 진행합니다.",
+                file=sys.stderr,
+            )
+        tag_mode = "random"
+
+    ch, part_label = pick_programmers_challenge(
+        challenges,
+        tag_mode,
+        part_tags,
+        chosen_tag=chosen_tag,
+        seen_keys=seen_keys,
+    )
+    print_programmers_problem(ch, part_label=part_label, show_statement=not args.no_statement)
+
+    if not args.no_record_seen and ch.get("id") is not None:
+        append_seen_record(seen_path, seen_record_for_programmers(ch, part_label))
+
+
+def main_boj(
+    args: argparse.Namespace,
+    seen_path: Path,
+    seen_keys: Set[Tuple[str, int]],
+) -> None:
     explicit_tag = (
         args.no_random_tag
         or args.tag_random
@@ -908,15 +1343,15 @@ def main(argv: Optional[List[str]] = None) -> None:
             [],
             chosen_tag=chosen_tag,
             lang=lang,
-            seen_ids=seen,
+            seen_keys=seen_keys,
         )
     elif tag_mode == "random":
         prob, query, tag_label = pick_problem(
-            tier, "random", tags, lang=lang, seen_ids=seen
+            tier, "random", tags, lang=lang, seen_keys=seen_keys
         )
     else:
         prob, query, tag_label = pick_problem(
-            tier, "none", [], lang=lang, seen_ids=seen
+            tier, "none", [], lang=lang, seen_keys=seen_keys
         )
 
     if not prob:
